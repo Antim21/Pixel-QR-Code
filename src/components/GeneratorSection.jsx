@@ -196,13 +196,60 @@ export default function GeneratorSection({ serverConfig, initialUrl, onClearInit
     setIsUploading(true);
     setUploadStatus(null);
 
-    // 1. Cloud Upload mode (calls tmpfiles.org via corsproxy.io)
-    if (uploadMode === 'cloud') {
+    // If local backend is running, route all uploads through it
+    if (serverConfig) {
       try {
         const formData = new FormData();
         formData.append('file', selectedFile);
 
-        // Fetch via CORS Proxy
+        const response = await fetch(`/api/upload?mode=${uploadMode}`, {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || `${uploadMode === 'cloud' ? 'Cloud' : 'Local'} upload failed`);
+        }
+
+        const result = await response.json();
+
+        if (result.success) {
+          setUploadStatus({
+            success: true,
+            url: result.url,
+            fullUrl: result.fullUrl,
+            originalName: selectedFile.name
+          });
+        } else {
+          throw new Error(`${uploadMode === 'cloud' ? 'Cloud' : 'Local'} upload rejected by server`);
+        }
+      } catch (err) {
+        console.error(err);
+        setUploadStatus({
+          success: false,
+          error: err.message || `Failed to upload in ${uploadMode} mode. Please try again.`
+        });
+      } finally {
+        setIsUploading(false);
+      }
+    }
+    // Fallback: If backend is NOT running (pure static frontend mode)
+    else {
+      if (uploadMode === 'local') {
+        setUploadStatus({
+          success: false,
+          error: 'Local backend is not running. Run npm run dev to start.'
+        });
+        setIsUploading(false);
+        return;
+      }
+
+      // Cloud mode fallback via corsproxy.io (if server is not running)
+      try {
+        const formData = new FormData();
+        formData.append('file', selectedFile);
+
         const response = await fetch('https://corsproxy.io/?url=https://tmpfiles.org/api/v1/upload', {
           method: 'POST',
           body: formData
@@ -212,10 +259,7 @@ export default function GeneratorSection({ serverConfig, initialUrl, onClearInit
         const result = await response.json();
 
         if (result.status === 'success') {
-          // tmpfiles.org returns: https://tmpfiles.org/12345/filename
-          // To make it directly downloadable / viewable, we format the URL
           const fileUrl = result.data.url;
-          // By replacing tmpfiles.org/XXXX with tmpfiles.org/dl/XXXX we get a direct view link
           const directUrl = fileUrl.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
 
           setUploadStatus({
@@ -231,50 +275,7 @@ export default function GeneratorSection({ serverConfig, initialUrl, onClearInit
         console.error(err);
         setUploadStatus({
           success: false,
-          error: 'Failed to upload to the temporary cloud. Please try again or use Local Mode.'
-        });
-      } finally {
-        setIsUploading(false);
-      }
-    } 
-    // 2. Local Wi-Fi mode (calls local Express server)
-    else {
-      if (!serverConfig) {
-        setUploadStatus({
-          success: false,
-          error: 'Local backend is not running. Run npm run dev to start.'
-        });
-        setIsUploading(false);
-        return;
-      }
-
-      try {
-        const formData = new FormData();
-        formData.append('file', selectedFile);
-
-        const response = await fetch('/api/upload', {
-          method: 'POST',
-          body: formData
-        });
-
-        if (!response.ok) throw new Error('Local upload failed');
-        const result = await response.json();
-
-        if (result.success) {
-          setUploadStatus({
-            success: true,
-            url: result.url,
-            fullUrl: result.fullUrl,
-            originalName: selectedFile.name
-          });
-        } else {
-          throw new Error('Local upload rejected by server');
-        }
-      } catch (err) {
-        console.error(err);
-        setUploadStatus({
-          success: false,
-          error: 'Failed to upload to the local server. Verify connection.'
+          error: 'Failed to upload to the temporary cloud. Please try again or run the local server.'
         });
       } finally {
         setIsUploading(false);

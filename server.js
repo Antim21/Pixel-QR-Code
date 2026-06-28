@@ -70,28 +70,102 @@ app.get('/api/config', (req, res) => {
 });
 
 // POST upload file
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    // Generate local access URL for this file
-    const fileUrl = `/uploads/${req.file.filename}`;
-    const fullUrl = `http://${LOCAL_IP}:${PORT}${fileUrl}`;
+    const { mode } = req.query;
 
-    res.json({
-      success: true,
-      filename: req.file.filename,
-      originalName: req.file.originalname,
-      size: req.file.size,
-      mimetype: req.file.mimetype,
-      url: fileUrl,       // relative URL (for frontend proxy)
-      fullUrl: fullUrl    // absolute URL with local IP (for QR scanner)
-    });
+    if (mode === 'cloud') {
+      try {
+        // Read file from local disk to upload to tmpfiles.org
+        const fileBuffer = await fs.promises.readFile(req.file.path);
+        const blob = new Blob([fileBuffer], { type: req.file.mimetype });
+        const formData = new FormData();
+        formData.append('file', blob, req.file.originalname);
+
+        // Upload to tmpfiles.org
+        const response = await fetch('https://tmpfiles.org/api/v1/upload', {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!response.ok) throw new Error('Cloud upload to tmpfiles.org failed');
+        const result = await response.json();
+
+        if (result.status === 'success') {
+          // Format cloud URL to direct download
+          const directUrl = result.data.url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+          
+          // Delete local file since it's uploaded to the cloud
+          try {
+            await fs.promises.unlink(req.file.path);
+          } catch (unlinkErr) {
+            console.error('Error deleting temp file:', unlinkErr);
+          }
+
+          return res.json({
+            success: true,
+            filename: req.file.filename,
+            originalName: req.file.originalname,
+            size: req.file.size,
+            mimetype: req.file.mimetype,
+            url: directUrl,
+            fullUrl: directUrl
+          });
+        } else {
+          throw new Error(result.message || 'Unknown tmpfiles.org error');
+        }
+      } catch (cloudError) {
+        console.error('Cloud upload failed, falling back/cleaning up:', cloudError);
+        // Delete local file to avoid leaks on error
+        try {
+          await fs.promises.unlink(req.file.path);
+        } catch (unlinkErr) {
+          console.warn('Failed to clean up temp file:', unlinkErr);
+        }
+        return res.status(502).json({ error: `Cloud upload failed: ${cloudError.message}` });
+      }
+    } else {
+      // Local Wi-Fi sharing mode: Generate download link
+      const fileUrl = `/api/download/${req.file.filename}?name=${encodeURIComponent(req.file.originalname)}`;
+      const fullUrl = `http://${LOCAL_IP}:${PORT}${fileUrl}`;
+
+      return res.json({
+        success: true,
+        filename: req.file.filename,
+        originalName: req.file.originalname,
+        size: req.file.size,
+        mimetype: req.file.mimetype,
+        url: fileUrl,       // relative URL (for frontend proxy)
+        fullUrl: fullUrl    // absolute URL with local IP (for QR scanner)
+      });
+    }
   } catch (error) {
     console.error('Upload error:', error);
-    res.status(500).json({ error: 'Server error during file upload' });
+    return res.status(500).json({ error: 'Server error during file upload' });
+  }
+});
+
+// GET download file (forces download with Content-Disposition)
+app.get('/api/download/:filename', (req, res) => {
+  try {
+    const filename = req.params.filename;
+    // Sanitize filename to prevent directory traversal
+    const safeFilename = path.basename(filename);
+    const filePath = path.join(uploadsDir, safeFilename);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).send('File not found');
+    }
+
+    const originalName = req.query.name || safeFilename;
+    res.download(filePath, originalName);
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).send('Server error during download');
   }
 });
 
@@ -101,31 +175,41 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/api/shorten', async (req, res) => {
-  const { url } = req.query;
+  const { url, alias } = req.query;
   if (!url) return res.status(400).json({ error: 'Missing url parameter' });
 
   // 1. Try is.gd first
   try {
-    const apiUrl = `https://is.gd/create.php?format=json&url=${encodeURIComponent(url)}`;
+    let apiUrl = `https://is.gd/create.php?format=json&url=${encodeURIComponent(url)}`;
+    if (alias) {
+      apiUrl += `&shorturl=${encodeURIComponent(alias)}`;
+    }
+    
     const response = await fetch(apiUrl);
-    if (response.ok) {
-      // Some error states in is.gd might still return 200 with text instead of JSON
-      const contentType = response.headers.get('content-type') || '';
-      if (contentType.includes('application/json') || contentType.includes('text/javascript')) {
-        const data = await response.json();
-        if (data.shorturl) {
-          return res.json({ shorturl: data.shorturl });
-        }
-      } else {
-        const text = await response.text();
-        console.warn('is.gd returned non-JSON response:', text);
+    const contentType = response.headers.get('content-type') || '';
+    
+    if (contentType.includes('application/json') || contentType.includes('text/javascript')) {
+      const data = await response.json();
+      if (data.shorturl) {
+        return res.json({ shorturl: data.shorturl });
+      } else if (data.errorcode === 2) {
+        return res.status(400).json({ error: 'This custom alias is already taken or invalid. Please try another one.' });
+      } else if (data.errormessage) {
+        throw new Error(data.errormessage);
       }
+    } else {
+      const text = await response.text();
+      console.warn('is.gd returned non-JSON response:', text);
+      throw new Error(text || `is.gd returned status ${response.status}`);
     }
   } catch (err) {
-    console.warn('is.gd failed, trying tinyurl fallback:', err.message);
+    console.warn('is.gd failed, trying fallback:', err.message);
+    if (alias) {
+      return res.status(422).json({ error: `Could not shorten with custom alias: ${err.message}` });
+    }
   }
 
-  // 2. Fallback to tinyurl.com if is.gd fails
+  // 2. Fallback to tinyurl.com if is.gd fails and no alias was requested
   try {
     const tinyUrl = `https://tinyurl.com/api-create.php?url=${encodeURIComponent(url)}`;
     const response = await fetch(tinyUrl);
